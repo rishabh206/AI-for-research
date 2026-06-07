@@ -1,11 +1,15 @@
 /**
- * LinkedIn Connections Research Agent
+ * Cozmo AI — LinkedIn SDR Research Agent
  *
- * Reads your LinkedIn connections CSV export and uses Claude to identify
- * and score potential customers.
+ * Reads your LinkedIn connections CSV export and acts as a B2B SDR for Cozmo AI.
+ * For each connection it:
+ *   1. Researches the prospect (role, company, likely pain points)
+ *   2. Identifies AI customer support automation opportunities
+ *   3. Qualifies using BANT (Budget, Authority, Need, Timeline)
+ *   4. Drafts a personalized LinkedIn DM + cold email
  *
  * Usage:
- *   npx ts-node linkedin-research-agent.ts <connections.csv> [product-description]
+ *   npm run research -- Connections.csv
  *
  * To export your LinkedIn connections:
  *   LinkedIn → Me → Settings & Privacy → Data Privacy → Get a copy of your data
@@ -15,9 +19,33 @@
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "fs";
 import path from "path";
-import readline from "readline";
 
 const client = new Anthropic();
+
+// ─── Cozmo AI SDR context ─────────────────────────────────────────────────────
+
+const COZMO_SYSTEM_PROMPT = `You are a senior B2B SDR (Sales Development Representative) at Cozmo AI.
+
+ABOUT COZMO AI:
+Cozmo AI is an AI-powered customer support automation platform for SMBs.
+It deflects repetitive support tickets, auto-responds to common queries, and
+routes complex issues to humans — cutting support costs and response times.
+
+IDEAL CUSTOMER PROFILE (ICP):
+- Company size: 10–200 employees (SMB)
+- Roles: Head of Support, VP Customer Success, Head of CX, COO, Founder/CEO
+- Pain: High ticket volume, slow response times, support team scaling issues
+- Tech: SaaS, e-commerce, fintech, marketplace, or subscription businesses
+- Budget: <$10K ACV; short sales cycle (<30 days); self-serve or low-touch
+
+YOUR GOALS FOR EVERY PROSPECT:
+1. RESEARCH — Infer their likely support challenges from role + company
+2. AUTOMATION OPPORTUNITIES — Identify specific workflows Cozmo AI could automate
+3. BANT QUALIFICATION — Score Budget / Authority / Need / Timeline (1–3 each)
+4. OUTREACH — Write a personalized LinkedIn DM and a cold email
+
+TONE: Concise, human, consultative. Never pitch immediately. Lead with insight.
+BANT SCORING: 1 = weak signal, 2 = moderate, 3 = strong signal based on available info.`;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -31,40 +59,51 @@ interface Connection {
   profileUrl: string;
 }
 
-interface ScoredConnection extends Connection {
-  score: number; // 1–10
-  tier: "hot" | "warm" | "cold";
-  reasoning: string;
-  suggestedApproach: string;
+interface BANTScore {
+  budget: number;     // 1–3
+  authority: number;  // 1–3
+  need: number;       // 1–3
+  timeline: number;   // 1–3
+  total: number;      // sum, 4–12
+  notes: string;
 }
 
-interface AnalysisBatch {
-  connections: Connection[];
-  results: ScoredConnection[];
+interface ProspectIntelligence extends Connection {
+  // ICP fit
+  icpScore: number;         // 1–10
+  tier: "hot" | "warm" | "cold";
+
+  // Research
+  likelyPainPoints: string;
+  automationOpportunities: string;
+
+  // BANT
+  bant: BANTScore;
+
+  // Outreach
+  linkedinDM: string;
+  coldEmailSubject: string;
+  coldEmailBody: string;
 }
 
 // ─── CSV Parsing ──────────────────────────────────────────────────────────────
 
 function parseCSV(filePath: string): Connection[] {
   const content = fs.readFileSync(filePath, "utf-8");
-  const lines = content.split(/\r?\n/).filter((l) => l.trim());
+  const lines = content.split(/\r?\n/).filter((l: string) => l.trim());
 
-  if (lines.length < 2) {
-    throw new Error("CSV file appears empty or has no data rows.");
-  }
+  if (lines.length < 2) throw new Error("CSV file appears empty.");
 
-  // LinkedIn CSV has a few header lines before the actual data; find the real header
-  const headerIndex = lines.findIndex((l) =>
+  const headerIndex = lines.findIndex((l: string) =>
     l.toLowerCase().includes("first name")
   );
   if (headerIndex === -1) {
     throw new Error(
-      'Could not find header row with "First Name" in the CSV. ' +
-        "Make sure you exported Connections from LinkedIn."
+      'Could not find "First Name" header. Export Connections from LinkedIn.'
     );
   }
 
-  const headers = parseCSVRow(lines[headerIndex]).map((h) =>
+  const headers = parseCSVRow(lines[headerIndex]).map((h: string) =>
     h.toLowerCase().replace(/\s+/g, "")
   );
 
@@ -74,7 +113,7 @@ function parseCSV(filePath: string): Connection[] {
     if (values.length < 3) continue;
 
     const row: Record<string, string> = {};
-    headers.forEach((h, idx) => {
+    headers.forEach((h: string, idx: number) => {
       row[h] = (values[idx] ?? "").trim();
     });
 
@@ -100,15 +139,10 @@ function parseCSVRow(line: string): string[] {
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+      else inQuotes = !inQuotes;
     } else if (ch === "," && !inQuotes) {
-      values.push(current);
-      current = "";
+      values.push(current); current = "";
     } else {
       current += ch;
     }
@@ -117,46 +151,57 @@ function parseCSVRow(line: string): string[] {
   return values;
 }
 
-// ─── Claude Analysis ──────────────────────────────────────────────────────────
+// ─── SDR Analysis ─────────────────────────────────────────────────────────────
 
-function buildConnectionSummary(c: Connection): string {
-  const parts = [`${c.firstName} ${c.lastName}`.trim()];
-  if (c.position) parts.push(`Position: ${c.position}`);
-  if (c.company) parts.push(`Company: ${c.company}`);
-  if (c.connectedOn) parts.push(`Connected: ${c.connectedOn}`);
-  return parts.join(" | ");
+function buildProspectLine(c: Connection, idx: number): string {
+  const parts: string[] = [`${idx + 1}.`];
+  parts.push(`${c.firstName} ${c.lastName}`.trim() || "(unknown)");
+  if (c.position) parts.push(`| ${c.position}`);
+  if (c.company) parts.push(`@ ${c.company}`);
+  return parts.join(" ");
 }
 
-async function analyzeConnectionBatch(
-  connections: Connection[],
-  productDescription: string
-): Promise<ScoredConnection[]> {
-  const connectionList = connections
-    .map((c, i) => `${i + 1}. ${buildConnectionSummary(c)}`)
+async function analyzeProspectBatch(
+  connections: Connection[]
+): Promise<ProspectIntelligence[]> {
+  const prospectList = connections
+    .map((c, i) => buildProspectLine(c, i))
     .join("\n");
 
-  const prompt = `You are a sales intelligence analyst. Evaluate the following LinkedIn connections as potential customers for this product/service:
+  const userPrompt = `Analyze these LinkedIn connections as potential Cozmo AI customers.
+For each prospect, apply your SDR expertise and return a JSON array.
 
-PRODUCT/SERVICE:
-${productDescription}
+PROSPECTS:
+${prospectList}
 
-LINKEDIN CONNECTIONS TO EVALUATE:
-${connectionList}
+Return a JSON array where each element has exactly these fields:
+{
+  "index": <1-based integer matching the list>,
+  "icpScore": <integer 1–10; 8+ = strong ICP fit>,
+  "tier": <"hot" if icpScore>=7, "warm" if 4–6, "cold" if <=3>,
+  "likelyPainPoints": <1–2 sentences on their probable support challenges>,
+  "automationOpportunities": <1–2 specific Cozmo AI use cases for this person's company>,
+  "bant": {
+    "budget": <1–3>,
+    "authority": <1–3>,
+    "need": <1–3>,
+    "timeline": <1–3>,
+    "total": <sum of above>,
+    "notes": <1 sentence on BANT rationale>
+  },
+  "linkedinDM": <a short (3–4 sentence) personalized LinkedIn DM — insight-led, no hard pitch>,
+  "coldEmailSubject": <a sharp subject line under 50 chars>,
+  "coldEmailBody": <a 5–7 sentence cold email: hook → pain → solution → CTA. Sign as "Rishabh, Cozmo AI">
+}
 
-For each connection, return a JSON array. Each element must have:
-- index: (number, 1-based, matching the list above)
-- score: (integer 1–10, where 10 = perfect customer fit)
-- tier: ("hot" if score >= 7, "warm" if 4–6, "cold" if <= 3)
-- reasoning: (1–2 sentences explaining the score based on their role/company)
-- suggestedApproach: (1 sentence on how to reach out)
-
-Return ONLY the JSON array, no other text.`;
+Return ONLY the JSON array. No extra text.`;
 
   const response = await client.messages.create({
     model: "claude-opus-4-8",
-    max_tokens: 4096,
+    max_tokens: 8192,
     thinking: { type: "adaptive" },
-    messages: [{ role: "user", content: prompt }],
+    system: COZMO_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userPrompt }],
   });
 
   const textBlock = response.content.find((b) => b.type === "text");
@@ -165,123 +210,128 @@ Return ONLY the JSON array, no other text.`;
   }
 
   let jsonText = textBlock.text.trim();
-  // Strip markdown code fences if present
   jsonText = jsonText.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
 
-  const parsed: Array<{
+  type RawResult = {
     index: number;
-    score: number;
+    icpScore: number;
     tier: string;
-    reasoning: string;
-    suggestedApproach: string;
-  }> = JSON.parse(jsonText);
+    likelyPainPoints: string;
+    automationOpportunities: string;
+    bant: {
+      budget: number;
+      authority: number;
+      need: number;
+      timeline: number;
+      total: number;
+      notes: string;
+    };
+    linkedinDM: string;
+    coldEmailSubject: string;
+    coldEmailBody: string;
+  };
+
+  const parsed: RawResult[] = JSON.parse(jsonText);
 
   return parsed.map((r) => {
     const conn = connections[r.index - 1];
     return {
       ...conn,
-      score: r.score,
-      tier: r.tier as ScoredConnection["tier"],
-      reasoning: r.reasoning,
-      suggestedApproach: r.suggestedApproach,
+      icpScore: r.icpScore,
+      tier: r.tier as ProspectIntelligence["tier"],
+      likelyPainPoints: r.likelyPainPoints,
+      automationOpportunities: r.automationOpportunities,
+      bant: r.bant,
+      linkedinDM: r.linkedinDM,
+      coldEmailSubject: r.coldEmailSubject,
+      coldEmailBody: r.coldEmailBody,
     };
   });
 }
 
 // ─── Output ───────────────────────────────────────────────────────────────────
 
-function writeResultsCSV(results: ScoredConnection[], outputPath: string) {
-  const header =
-    "Score,Tier,First Name,Last Name,Position,Company,Email,Connected On,Profile URL,Reasoning,Suggested Approach";
+function writeResultsCSV(results: ProspectIntelligence[], outputPath: string) {
+  const header = [
+    "ICP Score", "Tier", "BANT Total", "Budget", "Authority", "Need", "Timeline",
+    "First Name", "Last Name", "Position", "Company", "Email", "Connected On", "Profile URL",
+    "Likely Pain Points", "Automation Opportunities", "BANT Notes",
+    "LinkedIn DM", "Cold Email Subject", "Cold Email Body",
+  ].join(",");
+
   const rows = results.map((r) => {
     const cells = [
-      r.score,
-      r.tier,
-      r.firstName,
-      r.lastName,
-      r.position,
-      r.company,
-      r.emailAddress,
-      r.connectedOn,
-      r.profileUrl,
-      r.reasoning,
-      r.suggestedApproach,
+      r.icpScore, r.tier, r.bant.total,
+      r.bant.budget, r.bant.authority, r.bant.need, r.bant.timeline,
+      r.firstName, r.lastName, r.position, r.company,
+      r.emailAddress, r.connectedOn, r.profileUrl,
+      r.likelyPainPoints, r.automationOpportunities, r.bant.notes,
+      r.linkedinDM, r.coldEmailSubject, r.coldEmailBody,
     ].map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`);
     return cells.join(",");
   });
+
   fs.writeFileSync(outputPath, [header, ...rows].join("\n"), "utf-8");
 }
 
-function printSummary(results: ScoredConnection[]) {
+function printReport(results: ProspectIntelligence[]) {
   const hot = results.filter((r) => r.tier === "hot");
   const warm = results.filter((r) => r.tier === "warm");
   const cold = results.filter((r) => r.tier === "cold");
 
-  console.log("\n" + "═".repeat(60));
-  console.log("  RESULTS SUMMARY");
-  console.log("═".repeat(60));
+  const avgBant = (arr: ProspectIntelligence[]) =>
+    arr.length ? (arr.reduce((s, r) => s + r.bant.total, 0) / arr.length).toFixed(1) : "—";
+
+  console.log("\n" + "═".repeat(68));
+  console.log("  COZMO AI SDR REPORT");
+  console.log("═".repeat(68));
   console.log(
-    `  Total analyzed: ${results.length}  |  🔥 Hot: ${hot.length}  |  🌡️  Warm: ${warm.length}  |  ❄️  Cold: ${cold.length}`
+    `  Analyzed: ${results.length}  |  🔥 Hot: ${hot.length}  |  🌡️  Warm: ${warm.length}  |  ❄️  Cold: ${cold.length}`
   );
-  console.log("═".repeat(60));
+  console.log(
+    `  Avg BANT — Hot: ${avgBant(hot)}/12  |  Warm: ${avgBant(warm)}/12`
+  );
+  console.log("═".repeat(68));
 
   if (hot.length > 0) {
-    console.log("\n🔥 HOT LEADS (score 7–10)\n");
-    hot.slice(0, 10).forEach((r) => {
-      console.log(
-        `  [${r.score}/10] ${r.firstName} ${r.lastName} — ${r.position} @ ${r.company}`
-      );
-      console.log(`         ${r.reasoning}`);
-      console.log(`         → ${r.suggestedApproach}\n`);
+    console.log("\n🔥  HOT PROSPECTS  (ICP score 7–10)\n");
+    hot.slice(0, 8).forEach((r) => {
+      console.log(`  [${ r.icpScore}/10 | BANT ${r.bant.total}/12]  ${r.firstName} ${r.lastName}`);
+      console.log(`  ${r.position} @ ${r.company}`);
+      console.log(`  Pain:        ${r.likelyPainPoints}`);
+      console.log(`  Automation:  ${r.automationOpportunities}`);
+      console.log(`  BANT:        ${r.bant.notes}`);
+      console.log(`\n  LinkedIn DM:\n  ${r.linkedinDM.replace(/\n/g, "\n  ")}`);
+      console.log(`\n  Email — ${r.coldEmailSubject}`);
+      console.log(`  ${r.coldEmailBody.replace(/\n/g, "\n  ")}`);
+      console.log("\n" + "─".repeat(68));
     });
-    if (hot.length > 10) {
-      console.log(`  ... and ${hot.length - 10} more hot leads in the CSV.\n`);
+    if (hot.length > 8) {
+      console.log(`  + ${hot.length - 8} more hot prospects in the CSV.\n`);
     }
   }
 
   if (warm.length > 0) {
-    console.log("🌡️  TOP WARM LEADS (score 4–6)\n");
+    console.log("\n🌡️   TOP WARM PROSPECTS  (ICP score 4–6)\n");
     warm
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5)
+      .sort((a, b) => b.bant.total - a.bant.total)
+      .slice(0, 4)
       .forEach((r) => {
-        console.log(
-          `  [${r.score}/10] ${r.firstName} ${r.lastName} — ${r.position} @ ${r.company}`
-        );
-        console.log(`         ${r.reasoning}\n`);
+        console.log(`  [${r.icpScore}/10 | BANT ${r.bant.total}/12]  ${r.firstName} ${r.lastName} — ${r.position} @ ${r.company}`);
+        console.log(`  ${r.likelyPainPoints}\n`);
       });
   }
-}
-
-// ─── Interactive product description ─────────────────────────────────────────
-
-async function promptForProduct(): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  return new Promise((resolve) => {
-    rl.question(
-      "\nDescribe your product/service (who it's for, what it does, who's the ideal customer):\n> ",
-      (answer) => {
-        rl.close();
-        resolve(answer.trim());
-      }
-    );
-  });
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const [, , csvArg, ...rest] = process.argv;
+  const [, , csvArg] = process.argv;
 
   if (!csvArg) {
+    console.error("Usage: npm run research -- Connections.csv");
     console.error(
-      "Usage: npx ts-node linkedin-research-agent.ts <connections.csv> [product-description]"
-    );
-    console.error(
-      "\nTo get your LinkedIn connections CSV:\n" +
+      "\nExport your connections:\n" +
         "  LinkedIn → Me → Settings & Privacy → Data Privacy\n" +
         "  → Get a copy of your data → Connections → Request archive"
     );
@@ -294,56 +344,49 @@ async function main() {
     process.exit(1);
   }
 
-  let productDescription = rest.join(" ").trim();
-  if (!productDescription) {
-    productDescription = await promptForProduct();
-  }
-  if (!productDescription) {
-    console.error("Product description is required.");
-    process.exit(1);
-  }
-
-  console.log("\nParsing connections...");
+  console.log("\nCozmo AI SDR Agent starting...");
+  console.log("Parsing connections...");
   const connections = parseCSV(csvPath);
-  console.log(`Found ${connections.length} connections.`);
+  console.log(`Found ${connections.length} connections.\n`);
 
-  const BATCH_SIZE = 25;
-  const batches: Connection[][] = [];
-  for (let i = 0; i < connections.length; i += BATCH_SIZE) {
-    batches.push(connections.slice(i, i + BATCH_SIZE));
+  // Filter out connections with no useful data
+  const actionable = connections.filter((c) => c.position || c.company);
+  const skipped = connections.length - actionable.length;
+  if (skipped > 0) {
+    console.log(`Skipping ${skipped} connections with no role/company data.\n`);
   }
 
-  console.log(
-    `Analyzing in ${batches.length} batches of up to ${BATCH_SIZE}...\n`
-  );
+  const BATCH_SIZE = 15; // smaller batches for richer per-prospect output
+  const batches: Connection[][] = [];
+  for (let i = 0; i < actionable.length; i += BATCH_SIZE) {
+    batches.push(actionable.slice(i, i + BATCH_SIZE));
+  }
 
-  const allResults: ScoredConnection[] = [];
+  console.log(`Analyzing ${actionable.length} prospects in ${batches.length} batches...\n`);
+
+  const allResults: ProspectIntelligence[] = [];
   for (let i = 0; i < batches.length; i++) {
     process.stdout.write(
-      `  Batch ${i + 1}/${batches.length} (${batches[i].length} connections)... `
+      `  [${i + 1}/${batches.length}] ${batches[i].length} prospects... `
     );
     try {
-      const results = await analyzeConnectionBatch(
-        batches[i],
-        productDescription
-      );
+      const results = await analyzeProspectBatch(batches[i]);
       allResults.push(...results);
-      console.log("done");
+      console.log("✓");
     } catch (err) {
-      console.log("error — skipping batch");
+      console.log("error — skipping");
       console.error(`    ${err instanceof Error ? err.message : err}`);
     }
   }
 
-  // Sort by score descending
-  allResults.sort((a, b) => b.score - a.score);
+  allResults.sort((a, b) => b.icpScore - a.icpScore || b.bant.total - a.bant.total);
 
-  const outputPath = csvPath.replace(/\.csv$/i, "") + "_potential_customers.csv";
+  const outputPath = csvPath.replace(/\.csv$/i, "") + "_sdr_intelligence.csv";
   writeResultsCSV(allResults, outputPath);
 
-  printSummary(allResults);
+  printReport(allResults);
 
-  console.log(`\n✅ Full results saved to: ${outputPath}\n`);
+  console.log(`\n✅  Full SDR intelligence saved to: ${outputPath}\n`);
 }
 
 main().catch((err) => {
